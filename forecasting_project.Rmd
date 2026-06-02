@@ -11,7 +11,7 @@ This project aims to forecast the annual number of museum and archaeological sit
 # 2. Student Information
 
 - Student Name: Sabiha Gülçin Özkan
-- Course: Quantitative Analysis and Desicion Making
+- Course: Quantitative Analysis and Decision Making
 - Data Source: TÜİK
 
 # 3. TÜİK Data Source and Connection
@@ -542,4 +542,4 @@ The analysis accesses TÜİK data directly in R, performs all preprocessing step
 # 15. Author
 
 - Student Name: Sabiha Gülçin Özkan
-- Course: Quantitative Analysis and Desicion Making
+- Course: Quantitative Analysis and Decision Making
