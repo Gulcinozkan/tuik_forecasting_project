@@ -1,0 +1,545 @@
+---
+title: "Forecasting Museum and Archaeological Site Visitors in Türkiye"
+author: "Sabiha Gülçin Özkan"
+date: "2026-06-02"
+output: html_document
+---
+# 1. Project Overview
+
+This project aims to forecast the annual number of museum and archaeological site visitors in Türkiye using official data obtained from the Turkish Statistical Institute (TÜİK). The analysis compares several forecasting methods and identifies the most appropriate model for predicting the next available period.
+
+# 2. Student Information
+
+- Student Name: Sabiha Gülçin Özkan
+- Course: Quantitative Analysis and Desicion Making
+- Data Source: TÜİK
+
+# 3. TÜİK Data Source and Connection
+
+The selected data set is the annual museum and archaeological site visitor statistics published by TÜİK.
+
+- TÜİK theme/category: Culture and Sports
+- TÜİK table name: Number of Visitors to the Museums and Ruins
+- TÜİK dataflow ID: TR,DF_MUZE_ORENYER_ZYARETCI,1.0
+- Selected variable: Museum and archaeological site visitor count
+- Geographic coverage: Türkiye
+- Frequency: Annual
+- Time coverage: 2001–2024
+- Latest available observation: 2024
+- Forecast target period: 2025
+- Data access date: `r Sys.Date()`
+
+The data were accessed directly in R. The selected TÜİK table was identified through the `tuikr` package, and the data connection was created within the notebook.
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tuikr)
+library(httr)
+library(jsonlite)
+library(forecast)
+
+dir.create("outputs/tables", recursive = TRUE, showWarnings = FALSE)
+dir.create("outputs/figures", recursive = TRUE, showWarnings = FALSE)
+```
+
+# 4. Data Access in R
+
+The `statistical_tables()` function was first used to identify the selected TÜİK table and confirm the dataflow ID.
+
+```{r tuik-table-information}
+tables_10 <- statistical_tables("10")
+
+selected_table <- tables_10[
+  tables_10$dataflow_id == "TR,DF_MUZE_ORENYER_ZYARETCI,1.0",
+]
+
+selected_table
+```
+
+Since the direct `statistical_data()` function returned an authorization error, the TÜİK Data Portal API endpoint was accessed directly in R using `httr`. This still keeps the data access reproducible within the R notebook and does not use any manually downloaded or edited data file.
+
+```{r tuik-api-connection}
+response <- httr::POST(
+  "https://databrowser2.tuik.gov.tr/api/core/nodes/1/datasets/TR,DF_MUZE_ORENYER_ZYARETCI,1.0/data",
+  httr::add_headers(
+    "Accept" = "application/json, text/plain, */*",
+    "Content-Type" = "application/json",
+    "Origin" = "https://databrowser2.tuik.gov.tr",
+    "Referer" = "https://databrowser2.tuik.gov.tr/",
+    "UserLang" = "tr"
+  ),
+  body = "[]",
+  encode = "raw"
+)
+
+httr::status_code(response)
+
+txt <- httr::content(
+  response,
+  as = "text",
+  encoding = "UTF-8"
+)
+
+museum_json <- jsonlite::fromJSON(txt)
+```
+
+# 5. Use of TÜİK Data in R
+
+After importing the TÜİK data, several preprocessing steps were performed within R.
+
+These steps included:
+
+- selecting the museum and archaeological site visitor variable,
+- identifying the time variable,
+- confirming annual data frequency,
+- arranging observations chronologically,
+- checking missing values,
+- transforming the imported TÜİK output into a time-series structure suitable for forecasting.
+
+No manually downloaded, edited, or externally prepared data files were used.
+
+```{r data-preparation}
+grid <- expand.grid(
+  TIME_PERIOD  = names(museum_json$dimension$TIME_PERIOD$category$label),
+  MUZE_TUR     = names(museum_json$dimension$MUZE_TUR$category$label),
+  FREQ         = names(museum_json$dimension$FREQ$category$label),
+  INDICATOR    = names(museum_json$dimension$INDICATOR$category$label),
+  REF_AREA     = names(museum_json$dimension$REF_AREA$category$label),
+  DUZEY_SEVIYE = names(museum_json$dimension$DUZEY_SEVIYE$category$label),
+  KEEP.OUT.ATTRS = FALSE,
+  stringsAsFactors = FALSE
+)
+
+grid$index <- 0:(nrow(grid)-1)
+
+value_df <- data.frame(
+  index = as.integer(names(museum_json$value)),
+  visitors = as.numeric(unlist(museum_json$value))
+)
+
+museum_long <- merge(grid, value_df, by="index", all.x=TRUE)
+
+museum_series <- subset(
+  museum_long,
+  DUZEY_SEVIYE == "0" &
+    REF_AREA == "TR" &
+    INDICATOR == "K_MOYZS" &
+    FREQ == "A" &
+    MUZE_TUR == "_T"
+)
+
+museum_series <- museum_series[
+  order(as.numeric(museum_series$TIME_PERIOD)),
+]
+
+museum_series <- data.frame(
+  year = as.numeric(museum_series$TIME_PERIOD),
+  visitors = museum_series$visitors
+)
+
+museum_series
+```
+
+# 6. Exploratory Time Series Analysis
+
+The selected series contains annual museum and archaeological site visitor counts in Türkiye between 2001 and 2024.
+
+The series displays a clear long-term upward trend. Visitor numbers generally increased over time, although a substantial decline occurred in 2020 due to the COVID-19 pandemic. Following the pandemic period, visitor numbers recovered rapidly and reached their highest observed level in 2024.
+
+Because the data are annual, no recurring seasonal structure is expected.
+
+```{r exploratory-analysis}
+summary(museum_series$visitors)
+
+any(is.na(museum_series$visitors))
+```
+
+# 7. Forecasting Methods
+
+## 7.1 Accuracy Measure Function
+
+The same accuracy measures were used for all forecasting methods in order to ensure a fair comparison.
+
+```{r accuracy-function}
+accuracy_measures <- function(actual, forecast) {
+
+  error <- actual - forecast
+
+  bias <- mean(error, na.rm = TRUE)
+  mad <- mean(abs(error), na.rm = TRUE)
+  mse <- mean(error^2, na.rm = TRUE)
+  mape <- mean(abs(error / actual), na.rm = TRUE) * 100
+  rsfe <- sum(error, na.rm = TRUE)
+  tracking_signal <- rsfe / mad
+
+  data.frame(
+    Bias = bias,
+    MAD = mad,
+    MSE = mse,
+    MAPE = mape,
+    RSFE = rsfe,
+    Tracking_Signal = tracking_signal
+  )
+}
+```
+
+## 7.2 Naïve Forecasting
+
+The naïve forecasting method assumes that the next observation will be equal to the most recent observation.
+
+```{r naive-forecasting}
+museum_series$naive_forecast <- c(
+  NA,
+  head(museum_series$visitors, -1)
+)
+
+naive_actual <- museum_series$visitors[-1]
+naive_forecast <- museum_series$naive_forecast[-1]
+
+naive_accuracy <- accuracy_measures(
+  naive_actual,
+  naive_forecast
+)
+
+naive_next_forecast <- tail(
+  museum_series$visitors,
+  1
+)
+
+naive_accuracy$Method <- "Naive Forecasting"
+naive_accuracy$Next_Period_Forecast <- naive_next_forecast
+
+naive_accuracy
+```
+
+The naïve model produced a MAPE value of approximately 28.25%. Although simple, the method provides a useful benchmark for evaluating more advanced forecasting approaches.
+
+## 7.3 Moving Average
+
+A three-year moving average was selected because the series contains a relatively small number of annual observations and exhibits a long-term trend.
+
+```{r moving-average}
+museum_series$ma3_forecast <- NA
+
+for (i in 4:nrow(museum_series)) {
+  museum_series$ma3_forecast[i] <-
+    mean(museum_series$visitors[(i-3):(i-1)])
+}
+
+ma_actual <- museum_series$visitors[
+  !is.na(museum_series$ma3_forecast)
+]
+
+ma_forecast <- museum_series$ma3_forecast[
+  !is.na(museum_series$ma3_forecast)
+]
+
+ma_accuracy <- accuracy_measures(
+  ma_actual,
+  ma_forecast
+)
+
+ma_next_forecast <- mean(
+  tail(museum_series$visitors, 3)
+)
+
+ma_accuracy$Method <- "Moving Average (3-Year)"
+ma_accuracy$Next_Period_Forecast <- ma_next_forecast
+
+ma_accuracy
+```
+
+The moving average model smooths short-term fluctuations but may lag behind rapidly increasing trends.
+
+## 7.4 Weighted Moving Average
+
+More weight was assigned to recent observations using weights of 0.2, 0.3, and 0.5.
+
+```{r weighted-moving-average}
+museum_series$wma_forecast <- NA
+
+for(i in 4:nrow(museum_series)) {
+
+  museum_series$wma_forecast[i] <-
+    museum_series$visitors[i-3] * 0.2 +
+    museum_series$visitors[i-2] * 0.3 +
+    museum_series$visitors[i-1] * 0.5
+}
+
+wma_actual <- museum_series$visitors[
+  !is.na(museum_series$wma_forecast)
+]
+
+wma_forecast <- museum_series$wma_forecast[
+  !is.na(museum_series$wma_forecast)
+]
+
+wma_accuracy <- accuracy_measures(
+  wma_actual,
+  wma_forecast
+)
+
+wma_next_forecast <-
+  tail(museum_series$visitors,3)[1] * 0.2 +
+  tail(museum_series$visitors,3)[2] * 0.3 +
+  tail(museum_series$visitors,3)[3] * 0.5
+
+wma_accuracy$Method <- "Weighted Moving Average"
+wma_accuracy$Next_Period_Forecast <- wma_next_forecast
+
+wma_accuracy
+```
+
+The weighted moving average gives greater importance to recent observations and therefore reacts faster to changes in the series.
+
+## 7.5 Exponential Smoothing
+
+An alpha value of 0.30 was selected to balance stability and responsiveness.
+
+```{r exponential-smoothing}
+museum_series$es_forecast <- NA
+
+alpha <- 0.3
+
+museum_series$es_forecast[2] <- museum_series$visitors[1]
+
+for(i in 3:nrow(museum_series)) {
+
+  museum_series$es_forecast[i] <-
+    alpha * museum_series$visitors[i-1] +
+    (1 - alpha) * museum_series$es_forecast[i-1]
+}
+
+es_actual <- museum_series$visitors[
+  !is.na(museum_series$es_forecast)
+]
+
+es_forecast <- museum_series$es_forecast[
+  !is.na(museum_series$es_forecast)
+]
+
+es_accuracy <- accuracy_measures(
+  es_actual,
+  es_forecast
+)
+
+es_next_forecast <-
+  alpha * tail(museum_series$visitors,1) +
+  (1-alpha) * tail(museum_series$es_forecast,1)
+
+es_accuracy$Method <- "Exponential Smoothing"
+es_accuracy$Next_Period_Forecast <- es_next_forecast
+
+es_accuracy
+```
+
+Exponential smoothing produced a lower error than the moving average methods, indicating that giving more weight to recent observations improves forecasting performance.
+
+## 7.6 Trend-Adjusted Exponential Smoothing
+
+The time series exhibits a clear upward trend. Therefore, Holt’s Trend-Adjusted Exponential Smoothing method was applied.
+
+```{r holt-method}
+museum_ts <- ts(
+  museum_series$visitors,
+  start = 2001,
+  frequency = 1
+)
+
+holt_model <- holt(
+  museum_ts,
+  h = 1
+)
+
+holt_fitted <- fitted(holt_model)
+
+holt_actual <- museum_ts[-1]
+holt_forecast_values <- holt_fitted[-1]
+
+holt_accuracy <- accuracy_measures(
+  as.numeric(holt_actual),
+  as.numeric(holt_forecast_values)
+)
+
+holt_accuracy$Method <-
+  "Trend-Adjusted Exponential Smoothing"
+
+holt_accuracy$Next_Period_Forecast <-
+  as.numeric(holt_model$mean)
+
+holt_accuracy
+```
+
+Because the series contains a strong long-term trend, Holt’s method is expected to perform better than simple smoothing techniques.
+
+## 7.7 Linear Trend Projection
+
+Linear Trend Projection was estimated using ordinary least squares regression.
+
+```{r linear-trend-projection}
+museum_series$time <- 1:nrow(museum_series)
+
+trend_model <- lm(
+  visitors ~ time,
+  data = museum_series
+)
+
+trend_forecast <- predict(trend_model)
+
+trend_accuracy <- accuracy_measures(
+  museum_series$visitors,
+  trend_forecast
+)
+
+next_time <- nrow(museum_series) + 1
+
+trend_next_forecast <- predict(
+  trend_model,
+  newdata = data.frame(time = next_time)
+)
+
+trend_accuracy$Method <- "Linear Trend Projection"
+trend_accuracy$Next_Period_Forecast <- trend_next_forecast
+
+trend_accuracy
+
+summary(trend_model)
+```
+
+The estimated trend equation is:
+
+Visitors = 13,319,946 + 1,595,677 × Time
+
+The positive slope coefficient indicates that museum and archaeological site visitor numbers increased by approximately 1.6 million visitors per year on average.
+
+## 7.8 Seasonal Indices
+
+The selected TÜİK series contains annual observations only. Therefore, seasonal indices are not applicable because annual data do not contain recurring seasonal patterns.
+
+## 7.9 Additive Decomposition
+
+Additive decomposition was not applied because the selected annual series does not contain a seasonal component and has a limited number of observations.
+
+## 7.10 Multiplicative Decomposition
+
+Multiplicative decomposition was not applied because the selected annual series does not contain recurring seasonality.
+
+## 7.11 Regression with Trend and Seasonal Dummy Variables
+
+Seasonal dummy variables are not applicable because the selected series has annual frequency and therefore does not contain seasonal periods.
+
+# 8. Forecast Accuracy Comparison
+
+The forecasting methods were compared using Bias, MAD, MSE, MAPE, RSFE, and Tracking Signal.
+
+```{r comparison-table}
+results_table <- rbind(
+  naive_accuracy,
+  ma_accuracy,
+  wma_accuracy,
+  es_accuracy,
+  holt_accuracy,
+  trend_accuracy
+)
+
+results_table <- results_table[
+  ,
+  c(
+    "Method",
+    "Bias",
+    "MAD",
+    "MSE",
+    "MAPE",
+    "RSFE",
+    "Tracking_Signal",
+    "Next_Period_Forecast"
+  )
+]
+
+results_table
+
+write.csv(
+  results_table,
+  "outputs/tables/accuracy_comparison.csv",
+  row.names = FALSE
+)
+```
+
+# 9. Selection of the Superior Method
+
+Linear Trend Projection was selected as the superior forecasting method.
+
+Although several forecasting approaches produced reasonable results, Linear Trend Projection achieved the lowest MAPE value (26.09%) and the lowest MSE among the applicable methods.
+
+The selected series displays a clear long-term upward trend and does not contain seasonality. Therefore, a trend-based forecasting model is theoretically appropriate for the structure of the data.
+
+The actual versus forecast values also indicate that Linear Trend Projection captures the long-term movement of the series better than the alternative methods.
+
+For these reasons, Linear Trend Projection was selected as the superior forecasting method.
+
+# 10. Final Next-Period Forecast
+
+The final forecast was generated using Linear Trend Projection.
+
+```{r final-forecast}
+final_forecast <- data.frame(
+  Selected_Superior_Method = "Linear Trend Projection",
+  Data_Access_Date = as.character(Sys.Date()),
+  Latest_Available_Observation = 2024,
+  Forecast_Target_Period = 2025,
+  Forecasted_Value = round(as.numeric(trend_next_forecast)),
+  MAD = trend_accuracy$MAD,
+  MSE = trend_accuracy$MSE,
+  MAPE = trend_accuracy$MAPE,
+  RSFE = trend_accuracy$RSFE,
+  Tracking_Signal = trend_accuracy$Tracking_Signal
+)
+
+final_forecast
+
+write.csv(
+  final_forecast,
+  "outputs/tables/final_forecast.csv",
+  row.names = FALSE
+)
+```
+
+The forecasted number of museum and archaeological site visitors for 2025 is approximately 50.0 million visitors.
+
+# 11. Interpretation of Results
+
+The selected TÜİK variable represents the annual number of museum and archaeological site visitors in Türkiye.
+
+The series is suitable for forecasting because it contains a sufficiently long sequence of annual observations and displays a clear trend pattern.
+
+The analysis showed that trend-based methods generally performed better than simple averaging methods. The strong decline observed in 2020 reflects the impact of the COVID-19 pandemic, while the subsequent years indicate a substantial recovery in visitor numbers.
+
+Linear Trend Projection provided the most appropriate balance between forecasting accuracy and consistency with the observed structure of the series.
+
+# 12. Limitations
+
+Several limitations should be considered.
+
+- The series contains only annual observations.
+- The number of observations is relatively limited.
+- The COVID-19 pandemic created a major structural break in 2020.
+- Future visitor numbers may be influenced by economic conditions, tourism policies, and unexpected external events.
+- The analysis uses only historical visitor counts and does not include explanatory variables.
+
+# 13. Reproducibility
+
+This project can be reproduced by running the R Markdown notebook from beginning to end.
+
+The analysis accesses TÜİK data directly in R, performs all preprocessing steps within the notebook, generates forecasting models, produces comparison tables, and saves all outputs automatically.
+
+# 14. Repository Structure
+
+- README.md
+- forecasting_project.Rmd
+- forecasting_project.html
+- outputs/tables/
+- outputs/figures/
+
+# 15. Author
+
+- Student Name: Sabiha Gülçin Özkan
+- Course: Quantitative Analysis and Desicion Making
