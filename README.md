@@ -165,4 +165,4 @@ The repository contains the following files and folders:
 
 * Student Name: Sabiha Gülçin Özkan
 * Student Number: 138723004
-* Course: Quantitative Analysis and Desicion Making
+* Course: Quantitative Analysis and Decision Making
